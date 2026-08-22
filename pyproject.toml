@@ -1,0 +1,12 @@
+[project]
+name = "sysd"
+version = "0.1.0"
+description = "SysD service manager"
+readme = "README.md"
+authors = [
+    { name = "PlushkaNet" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "aiofiles>=25.1.0",
+]

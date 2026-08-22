@@ -1,0 +1,4 @@
+sysd.egg-info
+.venv
+build
+__pycache__
