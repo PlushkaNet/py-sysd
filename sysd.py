@@ -1,4 +1,97 @@
-from typing import Any
+__all__ = [
+    "SysD", "ServiceManagerBase", "ServiceBase",
+    "CommunicationServiceBase", "SysDException",
+    "ValidationError", "NoServiceError", "validate",
+    "important_missing", "NoConfigPathError", "ServiceNameAlreadyDefinedError"
+]
+
+from abc import ABC, abstractmethod
+from typing import Any, Literal
+
+_HypervisorExceptionAction = Literal["restart", "exit"]
+
+class ServiceManagerBase(ABC):
+    """Base abstract interface for system service managers"""
+    @abstractmethod
+    async def signal(self, service_name: str, method_name: str, method_body: dict, /) -> dict | None: ...
+
+    @abstractmethod
+    async def get_config(self) -> dict[str, dict[str, Any]]: ...
+
+    @abstractmethod
+    async def set_config(self, data: dict[str, dict[str, Any]], /): ...
+
+
+class ServiceBase(ABC):
+    """Base abstract interface for all service classes"""
+
+    _sysd: ServiceManagerBase
+    on_exception_action: _HypervisorExceptionAction
+
+    @abstractmethod
+    def post_init(self, config: dict[str, Any], /): ...
+
+    @abstractmethod
+    def set_config(self, new_config: dict[str, Any], /): ...
+
+    @abstractmethod
+    def validate_config(self, config: dict[str, Any], /): ...
+
+    @abstractmethod
+    def get_config(self) -> dict[str, Any]: ...
+
+    @abstractmethod
+    async def service(self): ...
+
+    @abstractmethod
+    def shutdown(self): ...
+
+
+class CommunicationServiceBase(ServiceBase):
+    @abstractmethod
+    async def call(self, method_name: str, method_body: dict, /): ...
+
+class SysDException(Exception):
+    """Base exception for all SysD exceptions"""
+
+class ValidationError(SysDException):
+    """Raised if some expected field in config invalid or missing"""
+    def __init__(self, what: str):
+        self._what = what
+    
+    def what(self):
+        return self._what
+
+class NoServiceError(SysDException):
+    """Raised if service send signal() to unknown service"""
+
+class NoConfigPathError(SysDException):
+    """Raised if tryed to save config to file with no file specified"""
+
+class ServiceNameAlreadyDefinedError(SysDException):
+    """Raised if tryed to add service with name that already defined"""
+
+def validate(value, _type):
+    """
+    Validates `value` with expected `_type`
+    Does nothing on success
+    Raises ValidationError() on failure
+    """
+    if not isinstance(value, _type):
+        raise ValidationError(f"{value!r} is not {_type.__name__!r} type")
+
+def important_missing(data: dict[str, Any], *args) -> bool:
+    """
+    Checks if the required key is missing from the dictionary
+    Returns True if the key is absent
+    Returns False if all keys are present
+    """
+    for i in args:
+        if data.get(i, None) is None:
+            return True
+
+    return False
+
 import logging
 import json
 import signal
@@ -6,25 +99,36 @@ import asyncio
 from contextlib import suppress
 import aiofiles
 
-from .abc import ServiceBase, CommunicationServiceBase, ServiceManagerBase, _HypervisorExceptionAction
-from .utils import ValidationError, NoServiceError
-
 class SysD(ServiceManagerBase):
     """Asynchronous SysD"""
-    def __init__(self, conf_path: str, /, services: dict[str, ServiceBase]):
-        """services is dictionary with {NAME:SERVICE}"""
+    __slots__ = [
+        "_services", "_signal_service_names", "_conf_path",
+        "_file", "_conf", "_logger", "_run", "_cancelled",
+        "_started", "_work", "_tasks"
+    ]
+    def __init__(self, conf: str | dict[str, Any], /, services: dict[str, ServiceBase]):
+        """
+        `conf` is path to the config or dictionary
+        `services` is dictionary with {NAME:SERVICE}
+        """
         self._services: dict[str, ServiceBase] = {}
         self._signal_service_names: list[str] = []
         for name, service in services.items():
             self.add_service(name, service)
 
-        self._conf_path = conf_path
-        self._conf: dict[str, dict[str, Any]] = {}
+        if isinstance(conf, str):
+            self._conf_path = conf
+            self._file = True
+            self._conf: dict[str, dict[str, Any]] = {}
+        else:
+            self._conf = conf
+            self._file = False
         self._logger = logging.getLogger(__name__)
         self._run = False # shut down by default
         self._cancelled = False
         self._started = False
         self._work = asyncio.Event()
+        self._tasks: list[asyncio.Task] = []
 
     async def signal(self, service_name: str, method_name: str, method_body: dict, /) -> dict | None:
         self._logger.debug(f"received signal to service: {service_name!r} and method {method_name!r} with body {method_body!r}")
@@ -51,8 +155,15 @@ class SysD(ServiceManagerBase):
 
     async def _run_services(self):
         """Runs all services"""
-        self._logger.info("load configuration from file")
-        await self.read_config_file()
+        if self._file:
+            self._logger.info("load configuration from file")
+            await self.read_config_file()
+        
+        # just to ensure that config has no another fields
+        # (that doesn't associated with any service)
+        for service_name in self._conf.keys():
+            if service_name not in self._services.keys():
+                raise ValidationError(f"no such service: {service_name!r}")
 
         self._logger.info("apply configuration to all services")
         for service_name, service in self._services.items():
@@ -62,12 +173,6 @@ class SysD(ServiceManagerBase):
                 # call validate method to ensure that service has NO validation exceptions
                 service.post_init({})
 
-        # just to ensure that config has no another fields
-        # (that doesn't associated with any service)
-        for service_name in self._conf.keys():
-            if service_name not in self._services.keys():
-                raise ValidationError(f"no such service: {service_name!r}")
-
         if not self._cancelled:
             self._run = True
         else:
@@ -76,7 +181,6 @@ class SysD(ServiceManagerBase):
         
         self._logger.info("start services")
 
-        self._tasks: list[asyncio.Task] = []
         for service in self._services.values():
             self._tasks.append(
                 asyncio.create_task(self._hypervisor(
@@ -136,18 +240,29 @@ class SysD(ServiceManagerBase):
     def add_service(self, name: str, service: ServiceBase, /):
         """Add service to services order"""
         setattr(service, "_sysd", self)
+        if name in self._services.keys():
+            raise ServiceNameAlreadyDefinedError("service name already defined")
         self._services[name] = service
         if isinstance(service, CommunicationServiceBase):
             self._signal_service_names.append(name)
+    
+    def _choose_path(self, path: str | None = None):
+        if not path:
+            if not self._file:
+                raise NoConfigPathError()
+            return self._conf_path
+        return path
 
-    async def read_config_file(self):
+    async def read_config_file(self, path: str | None = None):
         """Reads config from file to memory"""
-        async with aiofiles.open(self._conf_path, "r", encoding="utf-8") as file:
+        path = self._choose_path(path)
+        async with aiofiles.open(path, "r", encoding="utf-8") as file:
             self._conf = json.loads(await file.read())
 
-    async def write_config_file(self):
+    async def write_config_file(self, path: str | None = None):
         """Saves in-memory SysD config to file"""
-        async with aiofiles.open(self._conf_path, "w", encoding="utf-8") as file:
+        path = self._choose_path(path)
+        async with aiofiles.open(path, "w", encoding="utf-8") as file:
             await file.write(json.dumps(self._conf))
 
     async def get_config(self) -> dict[str, dict[str, Any]]:
@@ -192,9 +307,16 @@ class SysD(ServiceManagerBase):
             self._services[service_name].set_config(config)
 
         self._conf = for_validatation
-        await self.write_config_file()
+        if self._file:
+            await self.write_config_file()
 
     async def set_config(self, new_config: dict[str, dict[str, Any]], /):
+        # just to ensure that config has no new unused fields
+        # (that don't associated with any service)
+        for service_name in new_config.keys():
+            if service_name not in self._services.keys():
+                raise ValidationError(f"no such service: {service_name!r}")
+
         # validate configuration
         for service_name, service in self._services.items():
             if service_name in new_config.keys():
@@ -203,15 +325,10 @@ class SysD(ServiceManagerBase):
                 # call validate method to ensure that service has NO validation exceptions
                 service.validate_config({})
 
-        # just to ensure that config has no another fields
-        # (that don't associated with any service)
-        for service_name in new_config.keys():
-            if service_name not in self._services.keys():
-                raise ValidationError(f"no such service: {service_name!r}")
-
         # install configuration
         for service_name, service_config in new_config.items():
             self._services[service_name].set_config(service_config)
 
         self._conf = new_config
-        await self.write_config_file()
+        if self._file:
+            await self.write_config_file()
