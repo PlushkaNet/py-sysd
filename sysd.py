@@ -278,7 +278,7 @@ class SysD(ServiceManagerBase):
             else:
                 global_config[key] = value
 
-        for_validatation: dict[str, dict[str, Any]] = {} # services configs for validation
+        for_validation: dict[str, dict[str, Any]] = {} # services configs for validation
 
         for service_name, service in self._services.items():
             service_current_config = service.get_config()
@@ -296,17 +296,17 @@ class SysD(ServiceManagerBase):
                 for k, v in service_configs[service_name].items():
                     service_new_config[k] = v
 
-            for_validatation[service_name] = service_new_config
+            for_validation[service_name] = service_new_config
 
         # validate configs
-        for service_name, config in for_validatation.items():
+        for service_name, config in for_validation.items():
             self._services[service_name].validate_config(config)
 
         # install configs
-        for service_name, config in for_validatation.items():
+        for service_name, config in for_validation.items():
             self._services[service_name].set_config(config)
 
-        self._conf = for_validatation
+        self._conf = for_validation
         if self._file:
             await self.write_config_file()
 
