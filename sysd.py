@@ -156,13 +156,9 @@ class SysD(ServiceManagerBase):
         """Runs all services"""
         if self._conf_path:
             self._logger.info("load configuration from file")
-            await self.read_config_file()
-        
-        # just to ensure that config has no another fields
-        # (that doesn't associated with any service)
-        for service_name in self._conf.keys():
-            if service_name not in self._services.keys():
-                raise ValidationError(f"no such service: {service_name!r}")
+            await self.read_config_file(write=True)
+        else:
+            self._validate_config(self._conf)
 
         self._logger.info("apply configuration to all services")
         for service_name, service in self._services.items():
@@ -250,11 +246,17 @@ class SysD(ServiceManagerBase):
             return self._conf_path
         return path
 
-    async def read_config_file(self, path: str | None = None):
+    async def read_config_file(self, path: str | None = None, write: bool = True) -> dict[str, Any] | None:
         """Reads config from file to memory"""
         path = self._choose_path(path)
         async with aiofiles.open(path, "r", encoding="utf-8") as file:
-            self._conf = json.loads(await file.read())
+            new_config = json.loads(await file.read())
+        # validate
+        if write:
+            await self.set_config(new_config, save=False)
+        else:
+            self._validate_config(new_config)
+            return new_config
 
     async def write_config_file(self, path: str | None = None):
         """Saves in-memory SysD config to file"""
@@ -265,14 +267,14 @@ class SysD(ServiceManagerBase):
     async def get_config(self) -> dict[str, dict[str, Any]]:
         return self._conf
 
-    async def _install_config(self, new_config: dict[str, dict[str, Any]], /):
+    async def _install_config(self, new_config: dict[str, dict[str, Any]], save: bool, /):
         for service_name, service_config in new_config.items():
             self._services[service_name].set_config(service_config)
         self._conf = new_config
-        if self._conf_path:
+        if self._conf_path and save:
             await self.write_config_file()
 
-    async def merge_config(self, new_config: dict[str, Any], /):
+    async def merge_config(self, new_config: dict[str, Any], /, save: bool = True):
         global_config: dict[str, Any] = {}
         service_configs: dict[str, dict[str, Any]] = {}
 
@@ -304,9 +306,11 @@ class SysD(ServiceManagerBase):
             new_configs[service_name] = service_new_config
 
         # install configs
-        await self._install_config(new_configs)
+        await self._install_config(new_configs, save)
     
-    async def _validate_config(self, new_config: dict[str, dict[str, Any]], /):
+    def _validate_config(self, new_config: dict[str, dict[str, Any]], /):
+        if not isinstance(new_config, dict):
+            raise ValidationError("config must be a dict")
         # just to ensure that config has no new unused fields
         # (that don't associated with any service)
         for service_name in new_config.keys():
@@ -321,10 +325,11 @@ class SysD(ServiceManagerBase):
                 # call validate method to ensure that service has NO validation exceptions
                 service.validate_config({})
 
-    async def set_config(self, new_config: dict[str, dict[str, Any]], /):
-        await self._validate_config(new_config)
+    async def set_config(self, new_config: dict[str, dict[str, Any]], /, save: bool = True):
+        self._validate_config(new_config)
+        new_config = new_config.copy()
         for service_name in self._services.keys():
             if service_name not in new_config.keys():
                 new_config[service_name] = {}
         # install configuration
-        await self._install_config(new_config)
+        await self._install_config(new_config, save)
