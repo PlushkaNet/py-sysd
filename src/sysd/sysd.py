@@ -50,7 +50,7 @@ class SysD(ServiceManagerBase):
                     self._shutdown("HYPERVISOR EXCEPTION")
 
     async def _run_services(self):
-        """Runs all services and waits them to be completed"""
+        """Runs all services"""
         self._logger.info("load configuration from file")
         await self.read_config_file()
 
@@ -76,9 +76,9 @@ class SysD(ServiceManagerBase):
         
         self._logger.info("start services")
 
-        tasks: list[asyncio.Task] = []
+        self._tasks: list[asyncio.Task] = []
         for service in self._services.values():
-            tasks.append(
+            self._tasks.append(
                 asyncio.create_task(self._hypervisor(
                     service.service,
                     getattr(service, "on_exception_action", "exit")
@@ -86,15 +86,20 @@ class SysD(ServiceManagerBase):
             )
         self._started = True
         self._logger.info("services started")
+    
+    async def wait(self):
         await self._work.wait()
         self._logger.info("waiting for services to stop")
-        await asyncio.wait(tasks, timeout=30)
-        for task in tasks:
+        await asyncio.wait(self._tasks, timeout=30)
+        for task in self._tasks:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*self._tasks, return_exceptions=True)
 
-    async def run(self):
-        """Runs SysD"""
+    async def run(self, daemon: bool = False):
+        """
+        Runs SysD
+        Start services and returns immediately when `daemon` is set to `True`
+        """
         loop = asyncio.get_running_loop()
         with suppress(NotImplementedError):
             # Signals handling is not supported on Windows
@@ -109,6 +114,8 @@ class SysD(ServiceManagerBase):
                 signal.SIGINT,
             )
         await self._run_services()
+        if not daemon:
+            await self.wait()
 
     def _shutdown(self, sig, /):
         """Shuttes down application"""
