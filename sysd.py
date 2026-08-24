@@ -102,7 +102,7 @@ import aiofiles
 class SysD(ServiceManagerBase):
     """Asynchronous SysD"""
     __slots__ = [
-        "_services", "_signal_service_names", "_conf_path",
+        "_services", "_conf_path",
         "_file", "_conf", "_logger", "_run", "_cancelled",
         "_started", "_work", "_tasks"
     ]
@@ -112,7 +112,6 @@ class SysD(ServiceManagerBase):
         `services` is dictionary with {NAME:SERVICE}
         """
         self._services: dict[str, ServiceBase] = {}
-        self._signal_service_names: list[str] = []
         for name, service in services.items():
             self.add_service(name, service)
 
@@ -132,8 +131,9 @@ class SysD(ServiceManagerBase):
 
     async def signal(self, service_name: str, method_name: str, method_body: dict, /) -> dict | None:
         self._logger.debug(f"received signal to service: {service_name!r} and method {method_name!r} with body {method_body!r}")
-        if service_name in self._signal_service_names:
-            return await self._services[service_name].call(method_name, method_body)
+        service = self._services.get(service_name)
+        if isinstance(service, CommunicationServiceBase):
+            return await service.call(method_name, method_body)
         self._logger.error(f"no service found with name {service_name!r}")
         raise NoServiceError(f"no such service {service_name!r}")
     
@@ -243,8 +243,6 @@ class SysD(ServiceManagerBase):
         if name in self._services.keys():
             raise ServiceNameAlreadyDefinedError("service name already defined")
         self._services[name] = service
-        if isinstance(service, CommunicationServiceBase):
-            self._signal_service_names.append(name)
     
     def _choose_path(self, path: str | None = None):
         if not path:
