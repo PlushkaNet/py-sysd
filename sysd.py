@@ -2,7 +2,8 @@ __all__ = [
     "SysD", "ServiceManagerBase", "ServiceBase",
     "CommunicationServiceBase", "SysDException",
     "ValidationError", "NoServiceError", "validate",
-    "important_missing", "NoConfigPathError", "ServiceNameAlreadyDefinedError"
+    "important_missing", "NoConfigPathError", "ServiceNameAlreadyDefinedError",
+    "OnlyCommunicationServiceBase", "OnlyServiceBase", "OnlyServiceMixin"
 ]
 
 from abc import ABC, abstractmethod
@@ -20,7 +21,6 @@ class ServiceManagerBase(ABC):
 
     @abstractmethod
     async def set_config(self, data: dict[str, dict[str, Any]], /): ...
-
 
 class ServiceBase(ABC):
     """Base abstract interface for all service classes"""
@@ -46,10 +46,24 @@ class ServiceBase(ABC):
     @abstractmethod
     def shutdown(self): ...
 
-
 class CommunicationServiceBase(ServiceBase):
     @abstractmethod
     async def call(self, method_name: str, method_body: dict, /): ...
+
+class OnlyServiceMixin:
+    def post_init(self, config: dict[str, Any]): pass
+
+    def set_config(self, config: dict[str, Any]): pass
+
+    def validate_config(self, config: dict[str, Any]): pass
+
+    def get_config(self) -> dict: return {}
+
+class OnlyCommunicationServiceBase(OnlyServiceMixin, CommunicationServiceBase):
+    """Base for service-only communication classes"""
+
+class OnlyServiceBase(OnlyServiceMixin, ServiceBase):
+    """Base for service-only classes"""
 
 class SysDException(Exception):
     """Base exception for all SysD exceptions"""
