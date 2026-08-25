@@ -35,6 +35,7 @@ class ServiceBase(ABC):
 
     _sysd: ServiceManagerBase
     on_exception_action: _HypervisorExceptionAction
+    restart_seconds: float
 
     @abstractmethod
     def post_init(self, config: dict[str, Any], /): ...
@@ -151,7 +152,7 @@ class SysD(ServiceManagerBase):
         self._logger.error("no service found with name %s", service_name)
         raise NoServiceError(f"no such service {service_name!r}")
 
-    async def _hypervisor(self, func, on_exc: _HypervisorExceptionAction = "exit"):
+    async def _hypervisor(self, func, on_exc: _HypervisorExceptionAction = "exit", restartd: float = 5.0):
         while self._run:
             try:
                 await func()
@@ -166,6 +167,12 @@ class SysD(ServiceManagerBase):
                 if on_exc == "exit":
                     self._logger.fatal("as hypervisor on exception behaviour was set to %s, application is shutting down now", on_exc)
                     self._shutdown("HYPERVISOR EXCEPTION")
+                else:
+                    try:
+                        await asyncio.wait_for(self._work.wait(), timeout=restartd)
+                        return
+                    except asyncio.TimeoutError:
+                        continue
 
     async def _run_services(self):
         """Runs all services"""
@@ -195,7 +202,8 @@ class SysD(ServiceManagerBase):
             self._tasks.append(
                 asyncio.create_task(self._hypervisor(
                     service.service,
-                    getattr(service, "on_exception_action", "exit")
+                    getattr(service, "on_exception_action", "exit"),
+                    getattr(service, "restart_seconds", 5.0)
                 ))
             )
         self._started = True
