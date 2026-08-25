@@ -15,6 +15,7 @@ import json
 import signal
 import asyncio
 from contextlib import suppress
+from copy import deepcopy
 import aiofiles
 
 _HypervisorExceptionAction = Literal["restart", "exit"]
@@ -110,7 +111,7 @@ def important_missing(data: dict[str, Any], *args) -> bool:
     Returns False if all keys are present
     """
     for i in args:
-        if data.get(i, None) is None:
+        if i not in data:
             return True
 
     return False
@@ -135,7 +136,7 @@ class SysD(ServiceManagerBase):
             self._conf_path = conf
             self._conf: dict[str, dict[str, Any]] = {}
         else:
-            self._conf = conf
+            self._conf = deepcopy(conf)
             self._conf_path = None
         self._logger = logging.getLogger(__name__)
         self._run = False # shut down by default
@@ -178,17 +179,21 @@ class SysD(ServiceManagerBase):
         """Runs all services"""
         if self._conf_path:
             self._logger.info("load configuration from file")
-            await self.read_config_file(write=True)
+            # automatically validates config
+            conf: dict = await self.read_config_file(write=False)
         else:
             self._validate_config(self._conf)
+            conf = self._conf
 
         self._logger.info("apply configuration to all services")
         for service_name, service in self._services.items():
-            if service_name in self._conf.keys():
-                service.post_init(self._conf[service_name])
+            if service_name in conf:
+                service.post_init(deepcopy(conf[service_name]))
             else:
                 # call validate method to ensure that service has NO validation exceptions
                 service.post_init({})
+
+        await self._install_config(conf, False)
 
         if not self._cancelled:
             self._run = True
@@ -258,9 +263,9 @@ class SysD(ServiceManagerBase):
 
     def add_service(self, name: str, service: ServiceBase, /):
         """Add service to services order"""
-        setattr(service, "_sysd", self)
         if name in self._services:
             raise ServiceNameAlreadyDefinedError("service name already defined")
+        setattr(service, "_sysd", self)
         self._services[name] = service
 
     def _choose_path(self, path: str | None = None) -> str:
@@ -289,11 +294,14 @@ class SysD(ServiceManagerBase):
             await file.write(json.dumps(self._conf))
 
     async def get_config(self) -> dict[str, dict[str, Any]]:
-        return self._conf
+        return deepcopy(self._conf)
 
     async def _install_config(self, new_config: dict[str, dict[str, Any]], save: bool, /):
-        for service_name, service_config in new_config.items():
-            self._services[service_name].set_config(service_config)
+        for service_name in self._services:
+            if service_name in new_config:
+                self._services[service_name].set_config(deepcopy(new_config[service_name]))
+            else:
+                self._services[service_name].set_config({})
         self._conf = new_config
         if self._conf_path and save:
             await self.write_config_file()
@@ -352,6 +360,7 @@ class SysD(ServiceManagerBase):
             are ignored (e.g., {"nonexistent_field": 100} in new_config
             would not be added to any service).
         """
+        new_config = deepcopy(new_config)
         global_config: dict[str, Any] = {}
         service_configs: dict[str, dict[str, Any]] = {}
 
@@ -390,13 +399,13 @@ class SysD(ServiceManagerBase):
             raise ValidationError("config must be a dict")
         # just to ensure that config has no new unused fields
         # (that don't associated with any service)
-        for service_name in new_config.keys():
+        for service_name in new_config:
             if service_name not in self._services:
                 raise ValidationError(f"no such service: {service_name!r}")
 
         # validate configuration
         for service_name, service in self._services.items():
-            if service_name in new_config.keys():
+            if service_name in new_config:
                 service.validate_config(new_config[service_name])
             else:
                 # call validate method to ensure that service has NO validation exceptions
@@ -404,9 +413,5 @@ class SysD(ServiceManagerBase):
 
     async def set_config(self, new_config: dict[str, dict[str, Any]], /, save: bool = True):
         self._validate_config(new_config)
-        new_config = new_config.copy()
-        for service_name in self._services:
-            if service_name not in new_config.keys():
-                new_config[service_name] = {}
-        # install configuration
+        new_config = deepcopy(new_config)
         await self._install_config(new_config, save)
