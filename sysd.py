@@ -1,3 +1,5 @@
+"""Service manager for Python"""
+
 __all__ = [
     "SysD", "ServiceManagerBase", "ServiceBase",
     "CommunicationServiceBase", "SysDException",
@@ -8,6 +10,12 @@ __all__ = [
 
 from abc import ABC, abstractmethod
 from typing import Any, Literal
+import logging
+import json
+import signal
+import asyncio
+from contextlib import suppress
+import aiofiles
 
 _HypervisorExceptionAction = Literal["restart", "exit"]
 
@@ -72,7 +80,7 @@ class ValidationError(SysDException):
     """Raised if some expected field in config invalid or missing"""
     def __init__(self, what: str):
         self._what = what
-    
+
     def what(self):
         return self._what
 
@@ -106,13 +114,6 @@ def important_missing(data: dict[str, Any], *args) -> bool:
 
     return False
 
-import logging
-import json
-import signal
-import asyncio
-from contextlib import suppress
-import aiofiles
-
 class SysD(ServiceManagerBase):
     """Asynchronous SysD"""
     __slots__ = [
@@ -143,13 +144,13 @@ class SysD(ServiceManagerBase):
         self._tasks: list[asyncio.Task] = []
 
     async def signal(self, service_name: str, method_name: str, method_body: dict, /) -> dict | None:
-        self._logger.debug(f"received signal to service: {service_name!r} and method {method_name!r} with body {method_body!r}")
+        self._logger.debug("received signal to service: %s and method %s with body %s", service_name, method_name, str(method_body))
         service = self._services.get(service_name)
         if isinstance(service, CommunicationServiceBase):
             return await service.call(method_name, method_body)
-        self._logger.error(f"no service found with name {service_name!r}")
+        self._logger.error("no service found with name %s", service_name)
         raise NoServiceError(f"no such service {service_name!r}")
-    
+
     async def _hypervisor(self, func, on_exc: _HypervisorExceptionAction = "exit"):
         while self._run:
             try:
@@ -161,9 +162,9 @@ class SysD(ServiceManagerBase):
             except asyncio.CancelledError:
                 return
             except BaseException as e:
-                self._logger.exception("hypervisor got fatal exception")
+                self._logger.exception("hypervisor got fatal exception: %s", str(e))
                 if on_exc == "exit":
-                    self._logger.fatal(f"as hypervisor on exception behaviour was set to {on_exc!r}, application is shutting down now")
+                    self._logger.fatal("as hypervisor on exception behaviour was set to %s, application is shutting down now", on_exc)
                     self._shutdown("HYPERVISOR EXCEPTION")
 
     async def _run_services(self):
@@ -187,7 +188,7 @@ class SysD(ServiceManagerBase):
         else:
             self._logger.info("canceled")
             return
-        
+
         self._logger.info("start services")
 
         for service in self._services.values():
@@ -199,8 +200,9 @@ class SysD(ServiceManagerBase):
             )
         self._started = True
         self._logger.info("services started")
-    
+
     async def wait(self):
+        """Waits for services to stop"""
         await self._work.wait()
         self._logger.info("waiting for services to stop")
         await asyncio.wait(self._tasks, timeout=30)
@@ -232,7 +234,7 @@ class SysD(ServiceManagerBase):
 
     def _shutdown(self, sig, /):
         """Shuttes down application"""
-        self._logger.info(f"received {sig}, shut down services")
+        self._logger.info("received %s, shut down services", str(sig))
         try:
             if not self._started or not self._run:
                 return # to avoid service.shutdown for unstarted services
@@ -244,15 +246,15 @@ class SysD(ServiceManagerBase):
             try:
                 service.shutdown()
             except BaseException as e:
-                self._logger.exception("oops. shutdown raised an exception, which is abnormal for this method")
+                self._logger.exception("Service shutdown raised an exception: %s", str(e))
 
     def add_service(self, name: str, service: ServiceBase, /):
         """Add service to services order"""
         setattr(service, "_sysd", self)
-        if name in self._services.keys():
+        if name in self._services:
             raise ServiceNameAlreadyDefinedError("service name already defined")
         self._services[name] = service
-    
+
     def _choose_path(self, path: str | None = None) -> str:
         if not path:
             if not self._conf_path:
@@ -289,11 +291,64 @@ class SysD(ServiceManagerBase):
             await self.write_config_file()
 
     async def merge_config(self, new_config: dict[str, Any], /, save: bool = True):
+        """
+        Merges the current configuration with `new_config` in-place.
+
+        The merge process supports two types of overrides:
+        1. Global fields - applied to all services where the key matches
+        2. Service-specific fields - applied only to the specified service
+
+        Priority (highest to lowest):
+        1. Service-specific overrides (e.g., {"ServiceName": {"key": value}})
+        2. Global overrides (fields not matching any service name)
+        3. Current service configuration
+
+        The merged configuration is validated for each service before being applied.
+        If validation fails for any service, the merge is aborted and no changes
+        are applied (atomic operation).
+
+        Args:
+            new_config: Configuration dictionary to merge.
+                    Keys matching service names are treated as service-specific,
+                    all other keys are treated as global.
+            save: If True, persist the merged configuration to storage.
+                If False, only update in-memory configuration.
+
+        Returns:
+            None (modifies configs in-place)
+
+        Raises:
+            ValidationError: If any merged configuration fails validation
+                            for the corresponding service.
+
+        Example:
+            Current config:
+            {
+                "ServiceA": {"timeout": 30, "retries": 3},
+                "ServiceB": {"timeout": 60, "retries": 5}
+            }
+            
+            new_config:
+            {
+                "timeout": 45,              # Global override
+                "ServiceB": {"retries": 10} # Service-specific override
+            }
+            
+            Result:
+            {
+                "ServiceA": {"timeout": 45, "retries": 3},  # global timeout applied
+                "ServiceB": {"timeout": 45, "retries": 10}  # global timeout + specific retries
+            }
+            
+            Note: Global fields that don't match any existing service field
+            are ignored (e.g., {"nonexistent_field": 100} in new_config
+            would not be added to any service).
+        """
         global_config: dict[str, Any] = {}
         service_configs: dict[str, dict[str, Any]] = {}
 
         for key, value in new_config.items():
-            if key in self._services.keys() and isinstance(value, dict):
+            if key in self._services and isinstance(value, dict):
                 service_configs[key] = value
             else:
                 global_config[key] = value
@@ -309,10 +364,10 @@ class SysD(ServiceManagerBase):
                     service_new_config[k] = v
 
             for k, v in service_current_config.items():
-                if k not in service_new_config.keys():
+                if k not in service_new_config:
                     service_new_config[k] = v
 
-            if service_name in service_configs.keys():
+            if service_name in service_configs:
                 for k, v in service_configs[service_name].items():
                     service_new_config[k] = v
 
@@ -321,14 +376,14 @@ class SysD(ServiceManagerBase):
 
         # install configs
         await self._install_config(new_configs, save)
-    
+
     def _validate_config(self, new_config: dict[str, dict[str, Any]], /):
         if not isinstance(new_config, dict):
             raise ValidationError("config must be a dict")
         # just to ensure that config has no new unused fields
         # (that don't associated with any service)
         for service_name in new_config.keys():
-            if service_name not in self._services.keys():
+            if service_name not in self._services:
                 raise ValidationError(f"no such service: {service_name!r}")
 
         # validate configuration
@@ -342,7 +397,7 @@ class SysD(ServiceManagerBase):
     async def set_config(self, new_config: dict[str, dict[str, Any]], /, save: bool = True):
         self._validate_config(new_config)
         new_config = new_config.copy()
-        for service_name in self._services.keys():
+        for service_name in self._services:
             if service_name not in new_config.keys():
                 new_config[service_name] = {}
         # install configuration
