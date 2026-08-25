@@ -3,5 +3,5 @@
 Quick installation from GitHub using pip:
 
 ```
-pip install git+https://github.com/PlushkaNet/py-sysd.git
+pip install git+https://github.com/PlushkaNet/sysd.py.git
 ```
